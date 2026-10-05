@@ -34,6 +34,7 @@
 #include "alloc.h"
 #include "blob.h"
 #include "net.h"
+#include "block.h"
 extern bool vfs_path_canonical(char out[128], const char *path);
 
 #define MODULE_PML4_INDEX 1u
@@ -696,6 +697,30 @@ static void host_net_detach(void) {
         net_unbind_nic((unsigned)loading_slot);
 }
 
+static int host_block_attach(const void *ops) {
+    if (loading_slot < 0)
+        return -22;
+    const ArkBlockOps *table = (const ArkBlockOps *)ops;
+    if (!table || !table->sectors || !table->transfer || !table->flush)
+        return -22;
+#ifndef ARK_MODULE_HOST_TEST
+    Module *m = &modules[loading_slot];
+    uint64_t begin = m->code_va, end = m->code_va + m->rx_pages * PAGE_BYTES;
+    const void *fns[] = {(const void *)table->sectors, (const void *)table->transfer,
+                         (const void *)table->flush};
+    for (unsigned i = 0; i < sizeof fns / sizeof fns[0]; i++) {
+        uint64_t va = (uint64_t)(uintptr_t)fns[i];
+        if (va < begin || va >= end)
+            return -22;
+    }
+#endif
+    return block_bind_ops(ops, (unsigned)loading_slot);
+}
+static void host_block_detach(void) {
+    if (loading_slot >= 0)
+        block_unbind_ops((unsigned)loading_slot);
+}
+
 static const ArkDriverHost host_table = {
     .millis = platform_millis,
     .ticks = platform_ticks,
@@ -720,6 +745,8 @@ static const ArkDriverHost host_table = {
     .net_attach = host_net_attach,
     .net_detach = host_net_detach,
     .irq_attach = host_irq_attach,
+    .block_attach = host_block_attach,
+    .block_detach = host_block_detach,
 };
 static void module_poll_dispatch(unsigned slot) {
     if (slot >= ARCO_MODULE_MAX)
@@ -1128,6 +1155,7 @@ static int64_t module_remove(ArkDriverRequest *q) {
     /* A NIC driver should detach in DEINIT; force it so the network stack
      * can never call ops of a removed module. */
     net_unbind_nic((unsigned)slot);
+    block_unbind_ops((unsigned)slot);
     for (unsigned i = 0; i < m->device_count; i++)
         if (m->devices[i] >= 0)
             device_set_state((uint32_t)m->devices[i], 0, ARK_DEV_STATE_ABSENT);

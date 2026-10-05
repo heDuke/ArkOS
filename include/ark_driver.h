@@ -57,6 +57,16 @@ typedef struct {
     void (*read_mac)(uint8_t out[6]);
 } ArkNetOps;
 
+/* Block operations a storage driver installs with host->block_attach. Copied
+ * at attach time; pointers must stay inside the module RX window until
+ * block_detach or removal. transfer/flush run on the caller's stack and must
+ * be bounded and non-blocking. sectors is the capacity of the bound unit. */
+typedef struct {
+    uint64_t (*sectors)(void);
+    int (*transfer)(uint64_t lba, uint32_t count, void *buffer, int write);
+    int (*flush)(void);
+} ArkBlockOps;
+
 /* Function table handed to the driver at INIT. Every entry is a kernel
  * function chosen for a narrow job; there is no access to user pointers,
  * process state or page tables. Order is ABI: append only. */
@@ -109,7 +119,11 @@ typedef struct {
      * interrupt success — poll-only cannot pass the IOAPIC smoke gate.
      * MSI/MSI-X is still TODO. */
     int (*irq_attach)(uint32_t irq, void (*isr)(void));
-    uint32_t reserved[5];                   /* zero; future entries appended here */
+    /* block_attach binds one ArkBlockOps as a machine disk (one module disk at
+     * a time; -16 when already bound). Callable only from arco_entry. */
+    int (*block_attach)(const void *ops);
+    void (*block_detach)(void);
+    uint32_t reserved[3];                   /* zero; future entries appended here */
 } ArkDriverHost;
 
 /* Entry point every .arco image exports (symbol arco_entry). op is

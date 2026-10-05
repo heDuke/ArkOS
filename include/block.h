@@ -16,4 +16,7 @@ bool block_read(BlockDevice *device, uint64_t lba, uint32_t sectors, void *buffe
 bool block_write(BlockDevice *device, uint64_t lba, uint32_t sectors, const void *buffer);
 bool block_flush(BlockDevice *device);
 const char *block_error(void);
+/* Loadable .arco storage: one module may own a BlockDevice slot. */
+int block_bind_ops(const void *ops, unsigned owner);
+void block_unbind_ops(unsigned owner);
 #endif

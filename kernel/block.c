@@ -2,7 +2,11 @@
 #include "block.h"
 #ifndef ARK_BLOCK_HOST_TEST
 #include "ahci.h"
+#include "ark_driver.h"
 static bool native_ahci, initialized;
+static const ArkBlockOps *module_ops;
+static unsigned module_owner;
+static int module_disk = -1;
 #endif
 static BlockDevice devices[2];
 static const char *error_text = "";
@@ -166,18 +170,26 @@ void block_init(void) {
     delay();
 }
 bool block_read(BlockDevice *d, uint64_t lba, uint32_t count, void *b) {
+    if (module_ops && d && module_disk >= 0 && (int)d->id == module_disk)
+        return account_transfer(d->present && module_ops->transfer(lba, count, b, 0) == 0, false,
+                                count);
     return account_transfer(native_ahci
                                 ? (d && d->present && ahci_transfer(d->id, lba, count, b, false))
                                 : transfer(d, lba, count, b, false),
                             false, count);
 }
 bool block_write(BlockDevice *d, uint64_t lba, uint32_t count, const void *b) {
+    if (module_ops && d && module_disk >= 0 && (int)d->id == module_disk)
+        return account_transfer(
+            d->present && module_ops->transfer(lba, count, (void *)b, 1) == 0, true, count);
     return account_transfer(
         native_ahci ? (d && d->present && ahci_transfer(d->id, lba, count, (void *)b, true))
                     : transfer(d, lba, count, (void *)b, true),
         true, count);
 }
 bool block_flush(BlockDevice *d) {
+    if (module_ops && d && module_disk >= 0 && (int)d->id == module_disk)
+        return d && d->present && module_ops->flush() == 0;
     if (native_ahci)
         return d && d->present && ahci_flush(d->id);
     if (!d || !d->present) {
@@ -211,6 +223,59 @@ bool block_write(BlockDevice *d, uint64_t l, uint32_t n, const void *b) {
 }
 bool block_flush(BlockDevice *d) {
     return d && d->present && test_block_flush(d->id);
+}
+#endif
+#ifndef ARK_BLOCK_HOST_TEST
+int block_bind_ops(const void *ops, unsigned owner) {
+    const ArkBlockOps *table = (const ArkBlockOps *)ops;
+    if (!table || !table->sectors || !table->transfer || !table->flush)
+        return -22;
+    if (module_ops)
+        return -16;
+    if (!initialized)
+        block_init();
+    int slot = -1;
+    for (unsigned i = 0; i < 2; i++)
+        if (!devices[i].present) {
+            slot = (int)i;
+            break;
+        }
+    if (slot < 0) {
+        error_text = "No free block slot for module disk";
+        return -28;
+    }
+    uint64_t sec = table->sectors();
+    if (!sec) {
+        error_text = "Module disk reported zero capacity";
+        return -19;
+    }
+    module_ops = table;
+    module_owner = owner;
+    module_disk = slot;
+    devices[slot].id = (unsigned)slot;
+    devices[slot].present = true;
+    devices[slot].sectors = sec;
+    error_text = "";
+    return 0;
+}
+void block_unbind_ops(unsigned owner) {
+    if (!module_ops || module_owner != owner)
+        return;
+    if (module_disk >= 0 && module_disk < 2) {
+        devices[module_disk].present = false;
+        devices[module_disk].sectors = 0;
+    }
+    module_ops = 0;
+    module_disk = -1;
+}
+#else
+int block_bind_ops(const void *ops, unsigned owner) {
+    (void)ops;
+    (void)owner;
+    return -38;
+}
+void block_unbind_ops(unsigned owner) {
+    (void)owner;
 }
 #endif
 BlockDevice *block_device(unsigned id) {

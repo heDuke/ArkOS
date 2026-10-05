@@ -4,6 +4,7 @@
 #include "mmio.h"
 #include "process.h"
 #include "microcode.h"
+#include "acpi.h"
 #define CPU_CAP 8u
 static volatile uint32_t *lapic;
 static unsigned cpu_count = 1;
@@ -20,7 +21,6 @@ static struct {
     uint8_t idt[4096] __attribute__((aligned(16)));
 } cpus[CPU_CAP];
 extern const uint8_t ap_stub_start[], ap_stub_end[];
-extern const uint8_t *platform_acpi_rsdp(void);
 static uint32_t rd(unsigned offset) {
     return lapic[offset / 4];
 }
@@ -47,51 +47,9 @@ static void delay_ticks(unsigned ticks) {
     while (ticks_now() < end)
         __asm__ volatile("pause");
 }
-static bool checksum(const uint8_t *p, unsigned n) {
-    uint8_t sum = 0;
-    for (unsigned i = 0; i < n; i++)
-        sum += p[i];
-    return !sum;
-}
-static const uint8_t *table(uint64_t address) {
-    if (address < 0x100000 || address > 0xffff0000)
-        return 0;
-    const uint8_t *p = (const uint8_t *)(uintptr_t)address;
-    uint32_t size;
-    memcpy(&size, p + 4, 4);
-    return size >= 36 && size <= 65536 && checksum(p, size) ? p : 0;
-}
+/* MADT discovery is shared with the IOAPIC router (include/acpi.h). */
 static const uint8_t *madt(void) {
-    const uint8_t *r = platform_acpi_rsdp();
-    if (!r || strncmp((const char *)r, "RSD PTR ", 8) || !checksum(r, 20))
-        return 0;
-    uint64_t addr = 0;
-    unsigned stride = 4;
-    if (r[15] >= 2 && checksum(r, 36)) {
-        memcpy(&addr, r + 24, 8);
-        stride = 8;
-    }
-    if (!addr) {
-        uint32_t low;
-        memcpy(&low, r + 16, 4);
-        addr = low;
-        stride = 4;
-    }
-    const uint8_t *root = table(addr);
-    if (!root)
-        return 0;
-    uint32_t len;
-    memcpy(&len, root + 4, 4);
-    if (strncmp((const char *)root, stride == 8 ? "XSDT" : "RSDT", 4) || (len - 36) % stride)
-        return 0;
-    for (unsigned i = 36; i + stride <= len; i += stride) {
-        addr = 0;
-        memcpy(&addr, root + i, stride);
-        const uint8_t *t = table(addr);
-        if (t && !strncmp((const char *)t, "APIC", 4))
-            return t;
-    }
-    return 0;
+    return acpi_find_table("APIC");
 }
 static void copy_bytes(void *dst, const void *src, size_t bytes) {
     size_t words = bytes / 8;

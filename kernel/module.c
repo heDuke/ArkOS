@@ -85,8 +85,10 @@ static int loading_slot = -1; /* slot currently inside arco_entry(INIT/DEINIT) *
  * most once per boot and stays armed; the module's poll_fn pointer inside it
  * is swapped on reload, and the dispatch gate skips non-LOADED slots. */
 static bool poll_slot_registered[ARCO_MODULE_MAX];
-/* Legacy PIC lines owned by modules: -1 = free. Lines used by the platform
- * itself (PIT 0, PS/2 1 and 12, cascade 2) read as busy to irq_attach. */
+/* ISA lines (0..15) owned by modules: -1 = free. Lines used by the platform
+ * itself (PIT 0, PS/2 1 and 12, cascade 2) read as busy to irq_attach. The
+ * platform delivers a bound line through an IOAPIC RTE when the MADT lists
+ * one, else through the legacy 8259. */
 #define MODULE_IRQ_LINES 16u
 #define KERNEL_IRQ_MASK ((1u << 0) | (1u << 1) | (1u << 2) | (1u << 12))
 /* Static -1 fill is load-bearing: interrupts run before module_init, and a
@@ -94,6 +96,10 @@ static bool poll_slot_registered[ARCO_MODULE_MAX];
 static int8_t irq_owner[MODULE_IRQ_LINES] = {
     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
 static void (*irq_fn[MODULE_IRQ_LINES])(void);
+/* ISR invocations per bound line since its last irq_attach. Exposed in the
+ * driver detail ("irq11 ... n=42") so a poll-only driver cannot pass for an
+ * interrupt-driven one. */
+static uint64_t irq_count[MODULE_IRQ_LINES];
 static char last_error[128];
 /* Why an installed module did not activate during this boot. */
 static char boot_error[128];
@@ -482,35 +488,87 @@ static int host_register_poll(void (*poll)(void)) {
     m->has_poll = 1;
     return 0;
 }
-/* Platform hook: mask/unmask one legacy PIC line (no-ops in the host test). */
-void platform_irq_mask(unsigned irq);
-void platform_irq_unmask(unsigned irq);
-/* Drop every PIC line bound to slot: mask at the PIC first so no ISR can
- * run while the module is being torn down. */
+/* Platform hooks (kernel/platform.c; stateful stubs in the host test).
+ * route allocates delivery for one ISA line (IOAPIC RTE or PIC IMR bit) and
+ * fails visibly; release is its exact inverse. */
+int platform_irq_route(unsigned irq);
+void platform_irq_release(unsigned irq);
+void platform_irq_describe(unsigned irq, char *out, size_t cap);
+/* Drop every line bound to slot: release its RTE / mask the PIC line first
+ * so no ISR can run while the module is being torn down. */
 static void module_irq_release(unsigned slot) {
     for (unsigned i = 0; i < MODULE_IRQ_LINES; i++)
         if (irq_owner[i] == (int)slot) {
-            platform_irq_mask(i);
+            platform_irq_release(i);
             irq_owner[i] = -1;
             irq_fn[i] = 0;
         }
 }
+static void irq_attach_log(uint32_t irq, int rc, const char *why) {
+    char text[160], n[24];
+    strcopy(text, "[irq] ", sizeof text);
+    size_t at = strlen(text);
+    strcopy(text + at, loading_slot >= 0 ? modules[loading_slot].name : "?", sizeof text - at);
+    at = strlen(text);
+    strcopy(text + at, " irq_attach(", sizeof text - at);
+    at = strlen(text);
+    uint_to_str(irq, n);
+    strcopy(text + at, n, sizeof text - at);
+    at = strlen(text);
+    if (rc) {
+        strcopy(text + at, ") FAILED rc=-", sizeof text - at);
+        at = strlen(text);
+        uint_to_str((uint64_t)-(int64_t)rc, n);
+        strcopy(text + at, n, sizeof text - at);
+        at = strlen(text);
+        strcopy(text + at, " (", sizeof text - at);
+        at = strlen(text);
+        strcopy(text + at, why, sizeof text - at);
+        at = strlen(text);
+        strcopy(text + at, "); driver is poll-only unless it retries\n", sizeof text - at);
+    } else {
+        char route[64];
+        platform_irq_describe(irq, route, sizeof route);
+        strcopy(text + at, ") bound -> ", sizeof text - at);
+        at = strlen(text);
+        strcopy(text + at, route[0] ? route : "unrouted", sizeof text - at);
+        at = strlen(text);
+        strcopy(text + at, "\n", sizeof text - at);
+    }
+    serial_write(text);
+}
 static int host_irq_attach(uint32_t irq, void (*isr)(void)) {
-    if (loading_slot < 0 || !isr || irq >= MODULE_IRQ_LINES)
+    if (loading_slot < 0 || !isr || irq >= MODULE_IRQ_LINES) {
+        if (loading_slot >= 0)
+            irq_attach_log(irq, -22, !isr ? "null isr" : "line outside 0..15");
         return -22;
+    }
 #ifndef ARK_MODULE_HOST_TEST
     /* Same contract as net ops: the ISR must live in this module's own RX
      * code window, never in foreign or host code. */
     Module *m = &modules[loading_slot];
     uint64_t va = (uint64_t)(uintptr_t)isr;
-    if (va < m->code_va || va >= m->code_va + m->rx_pages * PAGE_BYTES)
+    if (va < m->code_va || va >= m->code_va + m->rx_pages * PAGE_BYTES) {
+        irq_attach_log(irq, -22, "isr outside module code");
         return -22;
+    }
 #endif
-    if ((KERNEL_IRQ_MASK & (1u << irq)) || irq_owner[irq] >= 0)
+    if ((KERNEL_IRQ_MASK & (1u << irq)) || irq_owner[irq] >= 0) {
+        irq_attach_log(irq, -16, "line owned by kernel or another module");
         return -16; /* platform-owned or already bound */
+    }
     irq_owner[irq] = (int8_t)loading_slot;
     irq_fn[irq] = isr;
-    platform_irq_unmask(irq);
+    irq_count[irq] = 0;
+    int rc = platform_irq_route(irq);
+    if (rc < 0) {
+        /* No IOAPIC pin / RTE busy: the binding never existed. */
+        irq_owner[irq] = -1;
+        irq_fn[irq] = 0;
+        irq_attach_log(irq, rc, rc == -19 ? "no IOAPIC pin for line" : "RTE busy");
+        return rc;
+    }
+    irq_attach_log(irq, 0, "");
     return 0;
 }
 /* Called from interrupt_dispatch before the PIC EOI. A stale binding (module
@@ -530,6 +588,7 @@ int module_irq_dispatch(unsigned irq) {
         module_irq_release((unsigned)slot);
         return 0;
     }
+    irq_count[irq]++;
     module_stack_call(m->stack_top, (void *)fn, 0, 0);
     return 1;
 }
@@ -551,9 +610,46 @@ static uint64_t host_phys_of(const void *va_ptr) {
     return 0;
 }
 #ifdef ARK_MODULE_HOST_TEST
-/* No PIC in the harness: the mask hooks become observable no-ops. */
-void platform_irq_mask(unsigned irq) { (void)irq; }
-void platform_irq_unmask(unsigned irq) { (void)irq; }
+/* No PIC/IOAPIC in the harness: a stateful route table stands in for the
+ * RTEs so the allocate/release contract is observable (a second route of a
+ * live line fails, release frees it, reload reallocates it exactly once). */
+static uint8_t test_routed[MODULE_IRQ_LINES];
+static unsigned test_route_events, test_release_events;
+static int test_route_fail = 0;
+int platform_irq_route(unsigned irq) {
+    if (irq >= MODULE_IRQ_LINES)
+        return -22;
+    if (test_route_fail)
+        return test_route_fail;
+    if (test_routed[irq])
+        return -16;
+    test_routed[irq] = 1;
+    test_route_events++;
+    return 0;
+}
+void platform_irq_release(unsigned irq) {
+    if (irq < MODULE_IRQ_LINES && test_routed[irq]) {
+        test_routed[irq] = 0;
+        test_release_events++;
+    }
+}
+void platform_irq_describe(unsigned irq, char *out, size_t cap) {
+    (void)irq;
+    strcopy(out, "test route", cap);
+}
+unsigned module_test_routed(unsigned *routes, unsigned *releases) {
+    unsigned live = 0;
+    for (unsigned i = 0; i < MODULE_IRQ_LINES; i++)
+        live += test_routed[i];
+    if (routes)
+        *routes = test_route_events;
+    if (releases)
+        *releases = test_release_events;
+    return live;
+}
+void module_test_route_fail(int rc) {
+    test_route_fail = rc;
+}
 /* No network stack in the harness; a stateful stub keeps the bind contract
  * exercisable (second bind fails until the owner's unbind). */
 static bool test_nic_bound;
@@ -926,10 +1022,26 @@ static int64_t module_install(ArkDriverRequest *q) {
         const char *name = q->path + 5;
         if (!name[0] || strlen(name) >= sizeof q->name)
             return -22;
-        uint32_t uid = accounts_current_uid();
+        /* ARK_BLOB_READ requires capacity == stored length (see blob_measure). */
+        uint32_t uid = accounts_current_uid(), length = 0;
+        bool measured = false;
+        for (unsigned i = 0; i < MODULE_BLOB_SCAN; i++) {
+            ArkBlobRequest qlist = {0};
+            qlist.op = ARK_BLOB_LIST;
+            qlist.index = i;
+            if (blob_kernel_request(&qlist, uid) < 0)
+                break;
+            if (!strcmp(qlist.name, name)) {
+                length = qlist.size;
+                measured = true;
+                break;
+            }
+        }
+        if (!measured || !length || length > sizeof file)
+            return strcopy(q->error, "source blob unreadable", sizeof q->error), -2;
         ArkBlobRequest b = {0};
         b.op = ARK_BLOB_READ;
-        b.capacity = sizeof file;
+        b.capacity = length;
         b.buffer = (uint64_t)(uintptr_t)file;
         strcopy(b.name, name, sizeof b.name);
         if (blob_kernel_request(&b, uid) < 0)
@@ -1058,6 +1170,41 @@ static void module_detail(const Module *m, char out[96]) {
             out[at++] = ',';
     }
     out[at] = 0;
+    /* Interrupt evidence: every bound line with its route and ISR count, or
+     * an explicit poll-only marker. Smoke gates read this, not the driver's
+     * own claims. */
+    int slot = (int)(m - modules);
+    bool any = false;
+    for (unsigned i = 0; i < MODULE_IRQ_LINES; i++) {
+        if (irq_owner[i] != slot)
+            continue;
+        char num[24], route[64];
+        platform_irq_describe(i, route, sizeof route);
+        strcopy(out + at, " irq", 96 - at);
+        at = strlen(out);
+        uint_to_str(i, num);
+        strcopy(out + at, num, 96 - at);
+        at = strlen(out);
+        strcopy(out + at, " ", 96 - at);
+        at = strlen(out);
+        /* "ioapic0 gsi11 vec43 level/high" is long; keep route kind + gsi. */
+        if (!strncmp(route, "ioapic", 6))
+            for (char *c = route; *c; c++)
+                if (!strncmp(c, " vec", 4)) {
+                    *c = 0;
+                    break;
+                }
+        strcopy(out + at, route[0] ? route : "unrouted", 96 - at);
+        at = strlen(out);
+        strcopy(out + at, " n=", 96 - at);
+        at = strlen(out);
+        uint_to_str(irq_count[i], num);
+        strcopy(out + at, num, 96 - at);
+        at = strlen(out);
+        any = true;
+    }
+    if (!any && m->used && m->state == ARK_DRV_STATE_LOADED)
+        strcopy(out + at, m->has_poll ? " irq:none (poll-only)" : " irq:none", 96 - at);
 }
 /* Embedded (inbox) modules carry no manifest entry; LIST appends them after
  * manifest entries so dev drivers shows the NIC driver too. */
@@ -1174,6 +1321,10 @@ void module_test_reset(void) {
     memset(poll_slot_registered, 0, sizeof poll_slot_registered);
     memset(irq_owner, 0xff, sizeof irq_owner);
     memset(irq_fn, 0, sizeof irq_fn);
+    memset(irq_count, 0, sizeof irq_count);
+    memset(test_routed, 0, sizeof test_routed);
+    test_route_events = test_release_events = 0;
+    test_route_fail = 0;
     test_map_count = 0;
     test_entry = 0;
     initialized = true;
@@ -1204,6 +1355,11 @@ int module_slot_view(unsigned slot, ModuleSlotView *out) {
     out->version = m->version;
     out->devices = m->device_count;
     out->has_poll = m->has_poll;
+    for (unsigned i = 0; i < MODULE_IRQ_LINES; i++)
+        if (m->used && irq_owner[i] == (int)slot) {
+            out->irq_lines |= 1u << i;
+            out->irq_count += irq_count[i];
+        }
     out->image_bytes = m->image_bytes;
     strcopy(out->name, m->name, sizeof out->name);
     memcpy(out->sha256, m->sha256, 32);

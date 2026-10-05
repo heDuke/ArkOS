@@ -841,9 +841,13 @@ static void test_host_table(void) {
     module_test_set_loading(-1);
     CHECK(host->device_register_poll(stub_poll) == -22);
     CHECK(host->device_register_poll(0) == -22);
-    /* one PIC line per module, only during INIT; platform lines stay busy */
+    /* one ISA line per module, only during INIT; platform lines stay busy.
+     * route allocates delivery; a second owner of a live line fails. */
+    unsigned routes0 = 0, releases0 = 0;
+    CHECK(module_test_routed(&routes0, &releases0) == 0);
     module_test_set_loading(0);
     CHECK(host->irq_attach(9, stub_poll) == 0);
+    CHECK(module_test_routed(0, 0) == 1);
     CHECK(host->irq_attach(9, stub_poll) == -16);
     CHECK(host->irq_attach(0, stub_poll) == -16);
     CHECK(host->irq_attach(12, stub_poll) == -16);
@@ -854,11 +858,24 @@ static void test_host_table(void) {
     module_test_set_loading(-1);
     CHECK(host->irq_attach(5, stub_poll) == -22);
     /* a line bound to a slot that never finished loading is stale: dispatch
-     * masks and releases it instead of reaching dead code */
+     * releases the RTE instead of reaching dead code */
     CHECK(module_irq_dispatch(9) == 0);
+    CHECK(module_test_routed(0, 0) == 0); /* released */
+    unsigned routes1 = 0, releases1 = 0;
+    module_test_routed(&routes1, &releases1);
+    CHECK(releases1 > releases0);
+    /* reload: the same line reallocates exactly once, no leftover */
     module_test_set_loading(1);
     CHECK(host->irq_attach(9, stub_poll) == 0);
+    CHECK(module_test_routed(0, 0) == 1);
     module_test_set_loading(-1);
+    /* a platform that cannot allocate an RTE fails visibly (-19); the
+     * binding is not left half-installed. */
+    module_test_route_fail(-19);
+    module_test_set_loading(0);
+    CHECK(host->irq_attach(5, stub_poll) == -19);
+    module_test_route_fail(0);
+    CHECK(module_test_routed(0, 0) == 1); /* only irq9 from slot 1 */
     /* counters and state against a missing node */
     CHECK(host->device_add_counters(9999, 1, 1, 1, 1) == -22);
     CHECK(host->device_set_state(9999, ARK_DEV_PRESENT, ARK_DEV_STATE_OK) == -22);

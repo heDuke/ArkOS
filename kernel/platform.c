@@ -37,6 +37,18 @@ const uint8_t *platform_acpi_rsdp(void) {
     return acpi_rsdp[0] ? acpi_rsdp : 0;
 }
 extern void platform_smp_eoi(void) __attribute__((weak));
+/* IOAPIC router (kernel/ioapic.c). Weak so diagnostic fixtures that link
+ * platform.c alone keep the legacy 8259 path. */
+extern bool ioapic_init(void) __attribute__((weak));
+extern int ioapic_route(unsigned) __attribute__((weak));
+extern void ioapic_release(unsigned) __attribute__((weak));
+extern void ioapic_mask(unsigned) __attribute__((weak));
+extern void ioapic_unmask(unsigned) __attribute__((weak));
+extern void ioapic_eoi(void) __attribute__((weak));
+extern unsigned ioapic_dump(const char *) __attribute__((weak));
+extern void ioapic_describe(unsigned, char *, size_t) __attribute__((weak));
+/* true once ISA lines are delivered by an IOAPIC; the 8259s stay masked. */
+static bool irq_apic_mode;
 bool platform_ram_range(uint64_t physical, uint64_t bytes) {
     if (!bytes || physical > UINT64_MAX - bytes)
         return false;
@@ -313,19 +325,68 @@ static void init_pic(void) {
     out8(0x21, 0xff);
     out8(0xa1, 0xff);
 }
-/* Runtime mask control for module-bound PIC lines. irq_attach unmasks after
- * binding; module removal masks again so a released handler can never run. */
+/* Runtime mask control for ISA lines 0..15. In IOAPIC mode the line's RTE
+ * mask bit is toggled (only for a routed line) and the 8259s are never
+ * touched; otherwise the legacy PIC IMR is used. */
 void platform_irq_mask(unsigned irq) {
+    if (irq_apic_mode) {
+        ioapic_mask(irq);
+        return;
+    }
     if (irq < 8)
         out8(0x21, (uint8_t)(in8(0x21) | (1u << irq)));
     else if (irq < 16)
         out8(0xa1, (uint8_t)(in8(0xa1) | (1u << (irq - 8))));
 }
 void platform_irq_unmask(unsigned irq) {
+    if (irq_apic_mode) {
+        ioapic_unmask(irq);
+        return;
+    }
     if (irq < 8)
         out8(0x21, (uint8_t)(in8(0x21) & ~(1u << irq)));
     else if (irq < 16)
         out8(0xa1, (uint8_t)(in8(0xa1) & ~(1u << (irq - 8))));
+}
+/* Allocate delivery for one line (irq_attach): an IOAPIC RTE (vector
+ * 32 + irq, MADT override polarity/trigger) or the PIC IMR bit. Release is
+ * the exact inverse, so unload/reload leaves no stale or duplicate entry. */
+int platform_irq_route(unsigned irq) {
+    if (irq >= 16)
+        return -22;
+    if (irq_apic_mode) {
+        int rc = ioapic_route(irq);
+        if (!rc)
+            ioapic_dump("after route+");
+        return rc;
+    }
+    platform_irq_unmask(irq);
+    return 0;
+}
+void platform_irq_release(unsigned irq) {
+    if (irq >= 16)
+        return;
+    if (irq_apic_mode) {
+        ioapic_release(irq);
+        ioapic_dump("after route-");
+        return;
+    }
+    platform_irq_mask(irq);
+}
+bool platform_irq_apic_mode(void) {
+    return irq_apic_mode;
+}
+/* Short delivery text for diagnostics ("ioapic0 gsi11 vec43 level/high"). */
+void platform_irq_describe(unsigned irq, char *out, size_t cap) {
+    if (!cap)
+        return;
+    out[0] = 0;
+    if (irq >= 16)
+        return;
+    if (irq_apic_mode)
+        ioapic_describe(irq, out, cap);
+    else
+        strcopy(out, "8259 pic", cap);
 }
 static volatile uint64_t ticks;
 static volatile uint64_t milliseconds;
@@ -919,8 +980,9 @@ InterruptFrame *interrupt_dispatch(InterruptFrame *frame) {
     }
     if (vector < 32 || vector >= 48)
         return frame;
-    /* Spurious IRQ7/15 have no matching ISR bit to acknowledge. */
-    if (vector == 39 || vector == 47) {
+    /* Spurious IRQ7/15 have no matching ISR bit to acknowledge. The 8259s are
+     * fully masked in IOAPIC mode, so vectors 39/47 are then real RTEs. */
+    if (!irq_apic_mode && (vector == 39 || vector == 47)) {
         uint16_t port = vector == 39 ? 0x20 : 0xa0;
         out8(port, 0x0b);
         if (!(in8(port) & 0x80)) {
@@ -935,12 +997,18 @@ InterruptFrame *interrupt_dispatch(InterruptFrame *frame) {
     }
     if (vector == 33 || vector == 44)
         drain_input();
-    /* Module-bound PIC lines run their ISR on the module stack; the driver
-     * acknowledges its device there, then the PIC EOI completes the cycle. */
+    /* Module-bound lines run their ISR on the module stack; the driver
+     * acknowledges its device there, then the EOI completes the cycle: LAPIC
+     * EOI for IOAPIC delivery (also clears Remote IRR on level RTEs), PIC EOI
+     * on the legacy path. */
     module_irq_dispatch(vector - 32);
-    if (vector >= 40)
-        out8(0xa0, 0x20);
-    out8(0x20, 0x20);
+    if (irq_apic_mode)
+        ioapic_eoi();
+    else {
+        if (vector >= 40)
+            out8(0xa0, 0x20);
+        out8(0x20, 0x20);
+    }
     if (vector == 32 && process_on_interrupt)
         return process_on_interrupt(frame);
     return frame;
@@ -957,6 +1025,21 @@ void platform_init(uint32_t magic, uint32_t mb_addr, BootInfo *info) {
     if (kernel_panic_display_init)
         kernel_panic_display_init(info);
     init_pic();
+    /* Real machines deliver ISA/PCI INTx through the IOAPIC; the 8259 path is
+     * kept only when the MADT has no usable IOAPIC (or no BSP LAPIC). */
+    if (ioapic_init)
+        irq_apic_mode = ioapic_init();
+    else
+        serial_write("[irq] legacy PIC only (IOAPIC router not linked)\n");
+    if (irq_apic_mode) {
+        out8(0x21, 0xff);
+        out8(0xa1, 0xff);
+        serial_write("[irq] 8259 PIC fully masked: IMR master=");
+        serial_hex(in8(0x21));
+        serial_write(" slave=");
+        serial_hex(in8(0xa1));
+        serial_write("\n");
+    }
     init_ps2();
     device_init();
     pci_init();
@@ -1012,9 +1095,21 @@ void platform_init(uint32_t magic, uint32_t mb_addr, BootInfo *info) {
     out8(0x43, 0x36);
     out8(0x40, (uint8_t)divisor);
     out8(0x40, (uint8_t)(divisor >> 8));
-    /* IRQ0 timer, IRQ1 keyboard, IRQ2 cascade, IRQ12 mouse. */
-    out8(0x21, 0xf8);
-    out8(0xa1, 0xef);
+    /* IRQ0 timer, IRQ1 keyboard, IRQ2 cascade (PIC only), IRQ12 mouse. */
+    if (irq_apic_mode) {
+        static const unsigned kernel_lines[] = {0, 1, 12};
+        for (unsigned i = 0; i < sizeof kernel_lines / sizeof kernel_lines[0]; i++)
+            if (ioapic_route(kernel_lines[i]) < 0) {
+                serial_write("[irq] Warning: kernel ISA line ");
+                serial_number(kernel_lines[i]);
+                serial_write(" not routed\n");
+            }
+        ioapic_dump("boot");
+    } else {
+        out8(0x21, 0xf8);
+        out8(0xa1, 0xef);
+        serial_write("[irq] legacy 8259 PIC delivery: IRQ0/1/2/12 unmasked\n");
+    }
     serial_write("[boot] PIT 1000 Hz; legacy clock 100 Hz; interrupts enabled\n");
     __asm__ volatile("sti" : : : "memory");
 }

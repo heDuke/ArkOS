@@ -89,6 +89,10 @@ check-device-host: | build
 check-module-host: | build
 	$(CC) -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -DARK_MODULE_HOST_TEST -DARK_DEVICE_HOST_TEST -DARK_PCI_HOST_TEST -DARK_BLOB_HOST_TEST -Iinclude tests/module_host_test.c kernel/module.c kernel/device.c kernel/pci.c kernel/blob.c kernel/sha256.c kernel/lib.c kernel/alloc.c -o build/module-host-test
 	ASAN_OPTIONS=detect_leaks=0 ./build/module-host-test
+.PHONY: check-ioapic-host
+check-ioapic-host: | build
+	$(CC) -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude tests/ioapic_host_test.c -o build/ioapic-host-test
+	./build/ioapic-host-test
 check-protection: iso
 	ARK_SMP_TEST=1 python3 tests/process_test.py
 	python3 tests/process_api_test.py

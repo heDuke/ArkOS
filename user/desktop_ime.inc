@@ -80,6 +80,13 @@ static void ime_commit(unsigned choice) {
     ArkPinyinCandidate c = ime_candidates.choices[choice];
     insert_input(c.text);
     cat(ime_committed, sizeof ime_committed, c.text);
+    /* Evidence that a native pinyin commit reached an isolated app process:
+     * text_dispatch flushed the whole batch through the target's surface. */
+    if (text_target >= 0 && thirdparty_app(text_target) && !pending_text[0]) {
+        serial_write("[ime] Native Pinyin commit accepted in ");
+        serial_write(eng_titles[text_target]);
+        serial_write(" process\n");
+    }
     unsigned n = (unsigned)strlen(ime_composition), used = c.consumed;
     if (used > n)
         return;

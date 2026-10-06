@@ -49,17 +49,23 @@ class VM:
   # next chord when a long disk operation advances guest/wall time differently.
   keys=key.split('-')
   self.q('input-send-event',{'events':[{'type':'key','data':{'down':True,'key':{'type':'qcode','data':part}}} for part in keys]})
-  time.sleep(.03)
+  time.sleep(.045)
   self.q('input-send-event',{'events':[{'type':'key','data':{'down':False,'key':{'type':'qcode','data':part}}} for part in reversed(keys)]})
-  time.sleep(.03)
+  time.sleep(.045)
  def type(self,text):
   lookup={' ':'spc','.':'dot','-':'minus','_':'shift-minus','/':'slash','>':'shift-dot','<':'shift-comma','|':'shift-backslash','"':'shift-apostrophe',"'":'apostrophe',':':'shift-semicolon',';':'semicolon','=':'equal','+':'shift-equal','(':'shift-9',')':'shift-0','!':'shift-1','\\':'backslash'}
   for ch in text:
    key=lookup.get(ch,ch.lower())
    if ch.isupper():key='shift-'+key
    self.key(key)
- def command(self,s):self.type(s);self.key('ret')
- def terminal(self):self.key('f1');time.sleep(.3)
+ def command(self,s):
+  # Wait for the next shell prompt so consecutive commands cannot interleave
+  # when the guest is slow to process input.
+  mark=len(self.log.read_text())
+  self.type(s);self.key('ret')
+  try:self.wait('$ ',timeout=20,after=mark)
+  except TimeoutError:pass
+ def terminal(self):self.key('f1');time.sleep(.5)
  def enroll_test_user(self):
   # Only call on an isolated blank fixture/RAM session, never a user's disk.
   self.wait('[session] setup ready')

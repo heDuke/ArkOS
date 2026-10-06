@@ -56,7 +56,14 @@ static uint32_t be32(const uint8_t *p) {
     return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
 }
 static uint64_t be64(const uint8_t *p) {
-    return (uint64_t)be32(p) << 32 | be32(p + 4);
+    /* The DTB is only 4-byte aligned and, until the MMU is enabled, is mapped
+       as Device memory where a wider unaligned access raises an alignment
+       fault. Keep this as two 32-bit loads so the compiler cannot fold it into
+       a single unaligned 64-bit access. */
+    uint32_t hi = be32(p);
+    __asm__ volatile("" ::: "memory");
+    uint32_t lo = be32(p + 4);
+    return (uint64_t)hi << 32 | lo;
 }
 static uint64_t counter(void) {
     uint64_t value;
